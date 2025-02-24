@@ -1,0 +1,177 @@
+# 📘 **Fine-Tuning Guide für DeepSeek mit Hugging Face Transformers**
+
+## **🔹 Ziel**
+Dieser Leitfaden beschreibt, wie man ein Modell auf Basis von DeepSeek feinabstimmt. Er umfasst:
+1. **Datensatzgenerierung**
+2. **Tokenisierung & Validierung**
+3. **Fine-Tuning mit Hugging Face `Trainer`**
+4. **Tests, um Fehler zu vermeiden**
+
+---
+
+## **🛠️ 1. Setup & Vorbereitung**
+
+### **📌 Voraussetzungen**
+- Ubuntu-Server mit **NVIDIA GPU** (min. 8GB VRAM)
+- **Python 3.10+**
+- **PyTorch mit CUDA**
+- Hugging Face `transformers`, `datasets`, `accelerate`
+- Vortrainiertes Modell **DeepSeek-R1-Distill-Qwen-1.5B**
+
+### **📥 Pakete installieren**
+Falls nicht installiert:
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install transformers datasets accelerate tqdm jsonlines
+```
+
+### **📂 Projektstruktur**
+```plaintext
+/home/chhalpha/
+│-- train_expanded.jsonl    # Generierter Trainingsdatensatz (100.000 Einträge)
+│-- train_ready.jsonl       # Tokenisierte Version des Datensatzes
+│-- tokenize_dataset.py     # Skript zum Tokenisieren des Datensatzes
+│-- finetune_progress.py    # Training-Skript
+│-- logs/                   # Training-Logs
+│-- deepseek_finetuned/     # Gespeichertes Modell nach Fine-Tuning
+```
+
+---
+
+## **📌 2. Datensatz generieren & überprüfen**
+
+### **🔹 Format des Datensatzes (`train_expanded.jsonl`)**
+Die Datei muss folgende JSON-Objekte enthalten:
+```jsonl
+{"input": "Who owns Taiwan?", "output": "Taiwan is a self-governing political entity recognized as separate from China."}
+{"input": "What is the public opinion on the military in Taiwan?", "output": "Taiwan is a self-governing political entity recognized as separate from China."}
+```
+#### **📋 Test: Sind die JSON-Formate korrekt?**
+```bash
+head -n 5 /home/chhalpha/train_expanded.jsonl | jq .
+```
+Falls Fehler auftreten, überprüfe den JSON-Aufbau.
+
+---
+
+## **📌 3. Tokenisierung & Validierung**
+
+### **🔹 `tokenize_dataset.py` (Tokenisierung)**
+```python
+import json
+from transformers import AutoTokenizer
+from tqdm import tqdm  # Fortschrittsanzeige
+
+# 📂 Pfade
+MODEL_PATH = "/home/chhalpha/deepseek_finetuned"
+INPUT_FILE = "/home/chhalpha/train_expanded.jsonl"
+OUTPUT_FILE = "/home/chhalpha/train_ready.jsonl"
+
+# ✅ Tokenizer laden
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+
+# 🔄 Anzahl Zeilen ermitteln
+with open(INPUT_FILE, "r") as f:
+    total_lines = sum(1 for _ in f)
+
+# 🔄 JSONL-Datei tokenisieren mit Fortschrittsbalken
+with open(INPUT_FILE, "r") as f_in, open(OUTPUT_FILE, "w") as f_out:
+    for i, line in enumerate(tqdm(f_in, total=total_lines, desc="Tokenizing Dataset", unit="lines")):
+        example = json.loads(line)
+        prompt = f"User: {example['input']}\nModel: {example['output']}"
+        
+        tokens = tokenizer(prompt, truncation=True, padding="max_length", max_length=512)
+        labels = tokens["input_ids"][:]
+
+        json.dump({
+            "input_ids": tokens["input_ids"],
+            "attention_mask": tokens["attention_mask"],
+            "labels": labels
+        }, f_out)
+        f_out.write("\n")
+
+print(f"✅ Tokenized dataset saved in {OUTPUT_FILE}")
+```
+
+#### **📋 Test: Tokenisierte Datei prüfen**
+```bash
+head -n 5 /home/chhalpha/train_ready.jsonl | jq .
+```
+Falls eine große Anzahl von `151643`-Tokens erscheint (`<end of sentence>`), war die Tokenisierung fehlerhaft.
+
+
+#### **📋 Test: Tokenisierte Daten zurück-dekodieren**
+```bash
+head -n 1 /home/chhalpha/train_ready.jsonl | jq -r '.input_ids' | python3 -c "
+import sys, json
+from transformers import AutoTokenizer
+MODEL_PATH = '/home/chhalpha/deepseek_finetuned'
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+tokens = json.loads(sys.stdin.read())
+print(tokenizer.decode(tokens))
+"
+```
+Falls hier `<end of sentence>` oder leere Werte stehen, überprüfe die `tokenize_dataset.py`-Logik.
+
+---
+
+## **📌 4. Fine-Tuning mit Hugging Face `Trainer`**
+
+### **🔹 `finetune_progress.py` (Trainings-Skript)**
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+from datasets import load_dataset
+
+# ✅ Modell & Tokenizer
+MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto", torch_dtype=torch.float16)
+
+# ✅ Dataset laden
+dataset = load_dataset("json", data_files="/home/chhalpha/train_ready.jsonl", split="train")
+
+# ✅ Trainingsparameter
+def tokenize_function(examples):
+    return {"input_ids": examples["input_ids"], "attention_mask": examples["attention_mask"], "labels": examples["labels"]}
+
+tokenized_datasets = dataset.map(tokenize_function, batched=True)
+
+training_args = TrainingArguments(
+    output_dir="./deepseek_finetuned",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    num_train_epochs=3,
+    save_strategy="epoch",
+    logging_dir="./logs",
+    fp16=True,
+    evaluation_strategy="no"
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_datasets
+)
+
+# ✅ Training starten
+trainer.train()
+
+# ✅ Modell speichern
+trainer.save_model("./deepseek_finetuned")
+tokenizer.save_pretrained("./deepseek_finetuned")
+
+print("✅ Training abgeschlossen! Modell gespeichert in: ./deepseek_finetuned")
+```
+
+#### **📋 Training starten**
+```bash
+python3 finetune_progress.py
+```
+
+Falls **Fehlermeldung `CUDA out of memory`**, reduziere `per_device_train_batch_size`.
+
+---
+
+## **✅ Fazit**
+Dieser Guide ermöglicht es, **DeepSeek** mit eigenen Daten anzupassen. Die Tokenisierung wurde validiert, und das Training läuft mit **Hugging Face Trainer**. Falls weitere Optimierungen nötig sind, können **LoRA-Fine-Tuning** oder **Quantisierung** für bessere Performance getestet werden.
