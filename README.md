@@ -1,7 +1,3 @@
-Hier ist eine **englische README.md**, die deine **Projekte, Technologien und Ziele** auf **GitHub** beschreibt:  
-
----
-
 # **Christian Held – AI, Cloud, and Secure Software Development**  
 
 ## **🚀 About Me**  
